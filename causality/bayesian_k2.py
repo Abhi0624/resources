@@ -1,169 +1,163 @@
 import numpy as np
 import random
-import math
+from math import log, exp
+from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import StandardScaler
-from pgmpy.models import BayesianNetwork
+from torch.utils.data import DataLoader, TensorDataset
 
-# Generate synthetic time series data
-np.random.seed(42)
-data = np.random.randn(100, 3)  # 100 time points, 3 variables
-
-# Helper function to generate a neighboring solution by swapping two nodes in the order
-def generate_neighbor(order):
-    new_order = order[:]
-    i, j = random.sample(range(len(order)), 2)
-    new_order[i], new_order[j] = new_order[j], new_order[i]
-    return new_order
-
-# Neural network model for predicting a node's values given its parents
-class SimpleNN(nn.Module):
-    def __init__(self, input_size):
-        super(SimpleNN, self).__init__()
-        self.fc1 = nn.Linear(input_size, 10)
-        self.fc2 = nn.Linear(10, 1)
-
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_dim):
+        super(NeuralNetwork, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+    
     def forward(self, x):
         x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        x = torch.relu(self.fc2(x))
+        probabilities = torch.sigmoid(x)  # Treating as probabilities for MDL
+        x = self.fc3(probabilities)
+        return x, probabilities
 
-# Helper function to prepare time-lagged data for a given node and its parents
-def prepare_lagged_data(data, node, parents, lag):
-    X, y = [], []
-    for t in range(lag, len(data)):
-        features = []
-        for parent in parents:
-            features.append(data[t-lag, parent])
-        X.append(features)
-        y.append(data[t, node])
-    return np.array(X), np.array(y)
+def build_neural_network(input_dim):
+    return NeuralNetwork(input_dim)
 
-# Helper function to calculate the log-likelihood using neural networks for time-lagged data
-def log_likelihood_nn_ts(data, node, parents, lag):
-    if not parents:
-        variance = np.var(data[lag:, node])
-    else:
-        X, y = prepare_lagged_data(data, node, parents, lag)
-
-        scaler = StandardScaler()
-        X = scaler.fit_transform(X)
-
-        X_tensor = torch.tensor(X, dtype=torch.float32)
-        y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
-
-        model = SimpleNN(len(parents))
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.01)
-
-        model.train()
-        for epoch in range(100):
+def train_neural_network(model, X_train, y_train, epochs=50, batch_size=16):
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.float32))
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    model.train()
+    for epoch in range(epochs):
+        for inputs, targets in train_loader:
             optimizer.zero_grad()
-            outputs = model(X_tensor)
-            loss = criterion(outputs, y_tensor)
+            outputs, _ = model(inputs)
+            loss = criterion(outputs, targets.view(-1, 1))
             loss.backward()
             optimizer.step()
 
+def neural_network_mdl_score(network, data):
+    num_nodes = len(network)
+    node_to_index = {node: idx for idx, node in enumerate(network)}
+    num_states = {node: np.unique(data[:, node_to_index[node]]).size for node in network}
+    score = 0.0
+    
+    for node in network:
+        parents = network[node]
+        parent_indices = [node_to_index[parent] for parent in parents]
+        node_index = node_to_index[node]
+        
+        if not parents:
+            continue
+        
+        X = data[:, parent_indices]
+        y = data[:, node_index]
+        
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        model = build_neural_network(len(parent_indices))
+        train_neural_network(model, X_train, y_train)
+        
         model.eval()
         with torch.no_grad():
-            predictions = model(X_tensor).numpy().flatten()
+            _, probabilities = model(torch.tensor(X_val, dtype=torch.float32))
+        
+        probabilities = probabilities.numpy().flatten()
+        log_likelihood = np.sum(np.log(probabilities))
+        
+        num_parent_combinations = np.prod([num_states[parent] for parent in parents])
+        model_length = (num_states[node] - 1) * num_parent_combinations
+        score += log_likelihood + 0.5 * model_length * log(data.shape[0])
+    
+    return score
 
-        residuals = y - predictions
-        variance = np.var(residuals)
-
-    return -0.5 * len(data) * np.log(2 * np.pi * variance)
-
-# Helper function to calculate the MDL score using neural networks for time-lagged data
-def mdl_score_nn_ts(data, node, parents, lag):
-    ll = log_likelihood_nn_ts(data, node, parents, lag)
-    num_params = sum(p.numel() for p in SimpleNN(len(parents)).parameters())
-    mdl = ll - 0.5 * num_params * np.log(len(data))
-    return mdl
-
-# K2 algorithm with given node order using MDL score with neural networks for time-lagged data
-def k2_algorithm_nn_ts(data, node_order, max_parents, lag):
-    num_nodes = data.shape[1]
-    best_parents = {i: [] for i in range(num_nodes)}
-    best_scores = {i: mdl_score_nn_ts(data, i, best_parents[i], lag) for i in range(num_nodes)}
-
+def k2_algorithm(node_order, data, max_parents=5):
+    network = {node: [] for node in node_order}
+    
     for node in node_order:
-        current_parents = best_parents[node]
-        current_score = best_scores[node]
-        improvement = True
+        best_score = neural_network_mdl_score(network, data)
+        while len(network[node]) < max_parents:
+            # Step 1: Select nodes before Xi and not in Pa(Xi)
+            candidates = list(set(node_order[:node_order.index(node)]) - set(network[node]))
+            if not candidates:
+                break
+            
+            best_candidate = None
+            for candidate in candidates:
+                network[node].append(candidate)
+                score = neural_network_mdl_score(network, data)
+                if score > best_score:
+                    best_score = score
+                    best_candidate = candidate
+                network[node].remove(candidate)
+                
+            if best_candidate:
+                network[node].append(best_candidate)
+            else:
+                break
+    
+    return network
 
-        while improvement:
-            improvement = False
-            best_new_score = current_score
-            best_new_parent = None
-
-            for potential_parent in range(num_nodes):
-                if potential_parent not in current_parents:
-                    new_parents = current_parents + [potential_parent]
-                    if len(new_parents) <= max_parents:
-                        new_score = mdl_score_nn_ts(data, node, new_parents, lag)
-                        if new_score > best_new_score:
-                            best_new_score = new_score
-                            best_new_parent = potential_parent
-
-            if best_new_parent is not None:
-                current_parents.append(best_new_parent)
-                current_score = best_new_score
-                improvement = True
-
-        best_parents[node] = current_parents
-        best_scores[node] = current_score
-
-    return best_parents
-
-# Simulated Annealing for optimizing the node order for time-lagged data
-def simulated_annealing_nn_ts(data, initial_order, max_parents, initial_temp, cooling_rate, max_iter, min_temp, lag):
+def simulated_annealing(initial_order, data, initial_temp, cooling_rate, min_temp, max_iterations):
     current_order = initial_order[:]
-    current_score = sum(mdl_score_nn_ts(data, node, k2_algorithm_nn_ts(data, current_order, max_parents, lag)[node], lag) for node in current_order)
+    current_network = k2_algorithm(current_order, data)
+    current_score = neural_network_mdl_score(current_network, data)
+    current_energy = -current_score  # Step 2: Convert score to energy
     best_order = current_order[:]
-    best_score = current_score
-    temp = initial_temp
+    best_energy = current_energy
+    
+    temperature = initial_temp
+    iteration_counter = 0
+    
+    while temperature > min_temp and iteration_counter < max_iterations:
+        new_order = current_order[:]
+        i, j = random.sample(range(len(new_order)), 2)
+        new_order[i], new_order[j] = new_order[j], new_order[i]  # Swap two nodes
+        
+        new_network = k2_algorithm(new_order, data)
+        new_score = neural_network_mdl_score(new_network, data)
+        new_energy = -new_score  # Step 2: Convert score to energy
+        
+        # Step 3: Compare energies and decide acceptance
+        delta_energy = new_energy - current_energy
+        if delta_energy < 0:
+            acceptance_prob = 1.0
+        else:
+            acceptance_prob = exp(-delta_energy / temperature)
+        
+        if acceptance_prob > random.random():
+            current_order = new_order[:]
+            current_energy = new_energy
+            iteration_counter = 0  # Reset iteration counter when accepting new parent set
+            if new_energy < best_energy:
+                best_order = new_order[:]
+                best_energy = new_energy
+        else:
+            iteration_counter += 1  # Increment iteration counter when not accepting new parent set
+        
+        # Step 4: Cooling schedule
+        temperature *= cooling_rate
+    
+    return best_order, -best_energy
 
-    while temp > min_temp:
-        for _ in range(max_iter):
-            new_order = generate_neighbor(current_order)
-            new_score = sum(mdl_score_nn_ts(data, node, k2_algorithm_nn_ts(data, new_order, max_parents, lag)[node], lag) for node in new_order)
+# Example usage with stock price time series data
+# Assuming stock_prices is a 2D numpy array where each column represents a stock and each row represents a time step
+stock_prices = np.random.rand(100, 5)  # Dummy stock price dataset with 100 time steps and 5 stocks
+time_steps = 3  # Example number of time steps
 
-            delta_score = new_score - current_score
-            if delta_score < 0 or random.random() < math.exp(-delta_score / temp):
-                current_order = new_order
-                current_score = new_score
-
-                if current_score < best_score:
-                    best_order = current_order
-                    best_score = current_score
-
-        temp *= cooling_rate
-
-    return best_order
-
-# Define the parameters
-initial_order = list(range(data.shape[1]))
-max_parents = 2
-initial_temp = 100.0
+# Create a list of nodes representing stocks at different time steps
+initial_order = [(stock, time) for time in range(time_steps) for stock in range(stock_prices.shape[1])]
+initial_temp = 1.0
 cooling_rate = 0.95
-max_iter = 100
-min_temp = 1e-3
-lag = 1  # Time lag to consider
+min_temp = 0.001
+max_iterations = 1000
 
-# Run Simulated Annealing to find the best node order for time-lagged data
-best_order = simulated_annealing_nn_ts(data, initial_order, max_parents, initial_temp, cooling_rate, max_iter, min_temp, lag)
+# Flatten the data into a format suitable for the algorithm
+flattened_data = np.hstack([stock_prices[:, np.newaxis] for _ in range(time_steps)]).reshape(-1, stock_prices.shape[1] * time_steps)
 
-# Run K2 algorithm with the best node order using MDL score with neural networks for time-lagged data
-best_parents = k2_algorithm_nn_ts(data, best_order, max_parents, lag)
-
-# Construct the Bayesian Network from the best parent sets
-model = BayesianNetwork()
-for node in range(data.shape[1]):
-    for parent in best_parents[node]:
-        model.add_edge(parent, node)
-
-print("Best node order:", best_order)
-print("Best parent sets:", best_parents)
-print("Learned Bayesian Network structure:", model.edges())
+best_order, best_score = simulated_annealing(initial_order, flattened_data, initial_temp, cooling_rate, min_temp, max_iterations)
+print("Best Node Order:", best_order)
+print("Best Score:", best_score)
