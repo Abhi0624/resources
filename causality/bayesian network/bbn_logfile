@@ -1,4 +1,4 @@
-2024-07-28 00:17:44,510 INFO     Bayesian Belief Network
+2024-07-28 00:17:44,510 INFO     Bayesian Belief Network (['AFG', 'CAT', 'MCD', 'MSFT', 'ORCL', 'UTX', 'WWD','ABT'])
 2024-07-28 00:20:21,809 INFO     Bayesian Belief Network
 2024-07-28 00:20:21,823 INFO     Stock with Causal Effects => (['ABT', 'AFG', 'CAT', 'MCD', 'MSFT', 'ORCL', 'UTX', 'WWD']) 
 2024-07-28 00:20:21,847 INFO     17
